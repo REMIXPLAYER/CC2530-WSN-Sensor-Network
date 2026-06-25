@@ -538,9 +538,13 @@ uint8 basicRfReceive(uint8* pRxData, uint8 len, int16* pRssi)
 *
 * @return      uint16 - source address of last received frame
 */
-uint16 basicRfReceiveAddress()
+uint16 basicRfReceiveAddress(void)
 {
-    return rxi.srcAddr;
+    uint16 addr;
+    halIntOff();
+    addr = rxi.srcAddr;
+    halIntOn();
+    return addr;
 }
 
 /**********************************************************************************
