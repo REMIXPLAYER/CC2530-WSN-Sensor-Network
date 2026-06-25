@@ -140,6 +140,7 @@ void rfSendData(void){
     int rlen;
     // P1-6：删除局部 sTemp/sHumidity 声明，使用全局变量（dht11_update 写，rfSendData 读）
     uint8 sendEnable = 1;    // 数据采集开关: 1=发送, 0=暂停
+    uint8 failCount = 0;    // 连续发送失败计数，超阈值触发重注册（业务缺陷2修复）
     
     // 启动时读取本机MAC地址（只读一次，后续直接用缓存）
     readMacAddress(macAddr);
@@ -167,48 +168,58 @@ void rfSendData(void){
             
             ret = csmaCaSendPacket(myRecvAddr, (uint8*)pTxData, strlen(pTxData) + 1);
             if (ret == SUCCESS) {
+                failCount = 0;       // 成功则清零
                 D6 = 0;       // P1-14：D6 短闪 50ms 表示正在发送数据
                 halMcuWaitMs(50);
                 D6 = 1;
+            } else {
+                if (++failCount >= 3) {   // 业务缺陷2：连续失败 3 次判定接收节点离线
+                    registered = 0;
+                    failCount = 0;
+                }
             }
         }
         
-        // === 阶段2：RX监听窗口（900ms，接收控制指令，MAC 自比对） ===
+        // === 阶段2：RX监听窗口（900ms 分片轮询，及时取包避免 rxCallback 覆盖未读包） ===
         basicRfReceiveOn();
-        halMcuWaitMs(900);
-
-        // P1-7：循环处理多个包，避免连续指令丢失
-        while (basicRfPacketIsReady()) {
-            rlen = basicRfReceive(pRxData, sizeof(pRxData), NULL);
-            if (rlen > 0 && rlen < sizeof(pRxData)) {
-                pRxData[rlen] = 0;
-                // MAC 比对：只响应发给本节点的指令
-                // P0-6：未注册时不响应指令（myRecvAddr=0，ACK 会发到地址 0 导致丢包）
-                if (registered && strstr((char*)pRxData, myMacStr)) {
-                    char ack[60] = {0};
-                    if (strstr((char*)pRxData, "LED=1")) {
-                        D7 = 0;
-                        printf("{cmd=LED ON}\r\n");
-                        sprintf(ack, "{CMD=SUCCESS, LED=1, MAC=%s}", myMacStr);
-                    } else if (strstr((char*)pRxData, "LED=0")) {
-                        D7 = 1;
-                        printf("{cmd=LED OFF}\r\n");
-                        sprintf(ack, "{CMD=SUCCESS, LED=0, MAC=%s}", myMacStr);
-                    } else if (strstr((char*)pRxData, "STATUS=1")) {
-                        sendEnable = 1;
-                        printf("{cmd=STATUS ON}\r\n");
-                        sprintf(ack, "{CMD=SUCCESS, STATUS=1, MAC=%s}", myMacStr);
-                    } else if (strstr((char*)pRxData, "STATUS=0")) {
-                        sendEnable = 0;
-                        printf("{cmd=STATUS OFF}\r\n");
-                        sprintf(ack, "{CMD=SUCCESS, STATUS=0, MAC=%s}", myMacStr);
-                    }
-                    if (ack[0]) {
-                        basicRfReceiveOff();
-                        basicRfConfig.ackRequest = FALSE;    // P1-11：ACK 包无需接收节点再回硬件 ACK
-                        csmaCaSendPacket(myRecvAddr, (uint8*)ack, strlen(ack) + 1);
-                        basicRfConfig.ackRequest = TRUE;     // 恢复
-                        basicRfReceiveOn();
+        {
+            uint8 waitMs;
+            for (waitMs = 0; waitMs < 90; waitMs++) {
+                halMcuWaitMs(10);
+                // P1-7 + 业务缺陷1修复：分片轮询及时取包，避免阻塞期间 rxCallback 覆盖未读的 rxi
+                while (basicRfPacketIsReady()) {
+                    rlen = basicRfReceive(pRxData, sizeof(pRxData), NULL);
+                    if (rlen > 0 && rlen < sizeof(pRxData)) {
+                        pRxData[rlen] = 0;
+                        // MAC 比对：只响应发给本节点的指令
+                        // P0-6：未注册时不响应指令（myRecvAddr=0，ACK 会发到地址 0 导致丢包）
+                        if (registered && strstr((char*)pRxData, myMacStr)) {
+                            char ack[60] = {0};
+                            if (strstr((char*)pRxData, "LED=1")) {
+                                D7 = 0;
+                                printf("{cmd=LED ON}\r\n");
+                                sprintf(ack, "{CMD=SUCCESS, LED=1, MAC=%s}", myMacStr);
+                            } else if (strstr((char*)pRxData, "LED=0")) {
+                                D7 = 1;
+                                printf("{cmd=LED OFF}\r\n");
+                                sprintf(ack, "{CMD=SUCCESS, LED=0, MAC=%s}", myMacStr);
+                            } else if (strstr((char*)pRxData, "STATUS=1")) {
+                                sendEnable = 1;
+                                printf("{cmd=STATUS ON}\r\n");
+                                sprintf(ack, "{CMD=SUCCESS, STATUS=1, MAC=%s}", myMacStr);
+                            } else if (strstr((char*)pRxData, "STATUS=0")) {
+                                sendEnable = 0;
+                                printf("{cmd=STATUS OFF}\r\n");
+                                sprintf(ack, "{CMD=SUCCESS, STATUS=0, MAC=%s}", myMacStr);
+                            }
+                            if (ack[0]) {
+                                basicRfReceiveOff();
+                                basicRfConfig.ackRequest = FALSE;    // P1-11：ACK 包无需接收节点再回硬件 ACK
+                                csmaCaSendPacket(myRecvAddr, (uint8*)ack, strlen(ack) + 1);
+                                basicRfConfig.ackRequest = TRUE;     // 恢复
+                                basicRfReceiveOn();
+                            }
+                        }
                     }
                 }
             }
