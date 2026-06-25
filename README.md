@@ -244,9 +244,130 @@ PC 串口 → {LED=1, MAC=00:12:4B:00:0D:C8:A8:CE}
 | 单一接收节点 | 支持多接收节点 |
 | 手动配置 PAN/信道 | 自动扫描锁定 |
 
-### 兼容性
+---
 
-v3.0 数据包格式与 v2.0 兼容（保留 `{Humidity, Temp, D, MAC}` 格式），现有接收节点可正常解析。
+## v3.0 升级路线
+
+### 决策点
+
+| 问题 | 决定 |
+|------|------|
+| 传感器数据走广播还是 P2P？ | **保持 P2P → 0x4102**（可靠 ACK，不丢数据包） |
+| 控制指令走什么？ | **广播 0xFFFF，传感器自比对 MAC** |
+| 短地址怎么设？ | 传感器从 MAC 末 2 字节派生（占位用），接收节点固定 0x4102 |
+| 广播需要 ACK 吗？ | 不需要。802.15.4 禁止广播 ACK，强行开 ACK 会导致超时 FAILED |
+
+### 待解决问题
+
+| # | 问题 | 严重 | 方案 |
+|---|------|------|------|
+| A | 广播 `0xFFFF` + `ackRequest=TRUE` → basicRfSendPacket 永远返回 FAILED | 🔴 | 广播前临时 `basicRfConfig.ackRequest = FALSE`，发完恢复 TRUE |
+| B | 串口指令 `{LED=1, MAC=...}` 长达 ~44 字符，CC2530 硬件 FIFO 仅 1 字节 | 🟡 | ISR 中环形缓冲区累积字节，收到 `}` 后设 `cmdReady` 标志 |
+| C | 主循环 csmaCaSendPacket 阻塞时后续串口字节丢失 | 🟡 | 环形缓冲解耦 ISR 和主循环；广播发送不重试（无 ACK，重试无意义） |
+| D | MAC 比对用 `strstr` 是否可靠 | 🟢 | 802.15.4 保证全球唯一，`strstr("00:12:4B:...")` 足够，无需额外处理 |
+
+### Phase 1：接收节点 — 串口缓冲 + 广播透传
+
+**文件**：`4.1-P2P-Recevier/main.c`
+
+```c
+// === 新增：环形缓冲区 ===
+#define CMD_BUF_SIZE 64
+char cmdBuf[CMD_BUF_SIZE];
+volatile uint8 cmdIdx = 0;
+volatile uint8 cmdReady = 0;
+
+// === ISR 改为累积字节 ===
+__interrupt void UART0_ISR(void) {
+    char c;
+    URX0IF = 0;
+    c = U0DBUF;
+    if (c == '@') { D7 = 0; return; }   // 本地指令立即执行
+    if (c == '!') { D7 = 1; return; }
+    if (cmdIdx < CMD_BUF_SIZE - 1) {
+        cmdBuf[cmdIdx++] = c;
+        if (c == '}') {                  // 收到结束符
+            cmdBuf[cmdIdx] = '\0';
+            cmdReady = 1;
+            cmdIdx = 0;
+        }
+    }
+}
+
+// === 主循环新增广播发送 ===
+void broadcastCmd(char* cmd) {
+    basicRfReceiveOff();
+    basicRfConfig.ackRequest = FALSE;          // 广播关 ACK
+    basicRfSendPacket(0xFFFF, (uint8*)cmd, strlen(cmd) + 1);
+    basicRfConfig.ackRequest = TRUE;           // 恢复
+    basicRfReceiveOn();
+    printf("{cmd=%s->BROADCAST}\r\n", cmd);
+}
+
+// === 主循环轮询 cmdReady ===
+if (cmdReady) {
+    cmdReady = 0;
+    broadcastCmd(cmdBuf);
+}
+```
+
+**删除**：`cmdPending`/`cmdTarget`/`cmdOn`、`sendLedCmd`/`sendDataCmd`/`sendWirelessCmd`、`csmaCaSendPacket`（接收节点不再需要定向发送）
+
+### Phase 2：传感器节点 — MAC 字符串比对
+
+**文件**：`4.1-P2P-DHT11/main.c`、`4.1-P2P-Photoresistance/main.c`
+
+```c
+// === 上电时生成 MAC 字符串 ===
+char myMacStr[24];              // "00:12:4B:00:0D:C8:A8:CE"
+sprintf(myMacStr, "%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X",
+        macAddr[7], macAddr[6], macAddr[5], macAddr[4],
+        macAddr[3], macAddr[2], macAddr[1], macAddr[0]);
+
+// === 短地址从 MAC 末 2 字节派生 ===
+basicRfConfig.myAddr = (macAddr[1] << 8) | macAddr[0];
+```
+
+```c
+// === RX 窗口：MAC 比对后执行 ===
+if (strstr((char*)pRxData, myMacStr)) {
+    if (strstr((char*)pRxData, "LED=1"))  { D7 = 0; printf("{cmd=LED ON}\r\n"); }
+    if (strstr((char*)pRxData, "LED=0"))  { D7 = 1; printf("{cmd=LED OFF}\r\n"); }
+    if (strstr((char*)pRxData, "SEND=1")) { sendEnable = 1; printf("{cmd=SEND ON}\r\n"); }
+    if (strstr((char*)pRxData, "SEND=0")) { sendEnable = 0; printf("{cmd=SEND OFF}\r\n"); }
+}
+```
+
+**删除**：`#define SEND_ADDR 0x4103` 等硬编码地址。`RECV_ADDR = 0x4102` 保留（传感器数据仍定向发送到接收节点）。
+
+### Phase 3：清理旧代码
+
+| 文件 | 删除 |
+|------|------|
+| 接收节点 | `sendLedCmd`、`sendDataCmd`、`sendWirelessCmd`、`cmdPending/cmdTarget/cmdOn`、ISR 中 `1`~`8`、`csmaCaSendPacket` |
+| 传感器 | `SEND_ADDR` 硬编码（改为 MAC 派生） |
+
+### 升级后串口指令
+
+| 指令 | 功能 |
+|------|------|
+| `@` | 接收节点 D7 亮（本地，瞬时） |
+| `!` | 接收节点 D7 灭（本地，瞬时） |
+| `{LED=1, MAC=00:12:4B:00:0D:C8:A8:CE}` | DHT11 灯亮 |
+| `{LED=0, MAC=00:12:4B:00:0D:C8:A8:CE}` | DHT11 灯灭 |
+| `{SEND=1, MAC=00:12:4B:00:0D:C6:88:62}` | 光敏恢复发送 |
+| `{SEND=0, MAC=00:12:4B:00:0D:C6:88:62}` | 光敏暂停发送 |
+| 其他格式 | 直接广播，传感器自匹配 |
+
+### 升级后不变量
+
+| 功能 | v2.0 → v3.0 |
+|------|-------------|
+| 传感器数据上报 | 不变（P2P → 0x4102，ACK） |
+| 数据包格式 | 不变（`{Humidity, Temp, D, MAC}`） |
+| 时分复用周期 | 不变（TX + RX200ms + 等待700ms） |
+| LCD 显示 | 不变（`{A0=,A1=}` / `{A0=}`） |
+| `@`/`!` 本地 LED | 不变 |
 
 ---
 
