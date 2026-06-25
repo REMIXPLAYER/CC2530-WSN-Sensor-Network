@@ -11,85 +11,162 @@
 #include "string.h"
 
 #define RF_CHANNEL            24                                // 2.4 GHz RF channel 
-#define PAN_ID                0x1410                            // 与4.5-WirelessControl保持一致
-#define RECV_ADDR             0x4102                            // 与4.5-WirelessControl保持一致  
+#define PAN_ID                0x1410                            // 班级PAN ID
+#define MY_ADDR               0x4102                            // 本机短地址
+#define DHT11_ADDR            0x4103                            // DHT11节点短地址
+#define PHOTO_ADDR            0x4101                            // 光敏节点短地址
 
 static basicRfCfg_t basicRfConfig;
 
-// 数据融合全局变量
-static int g_temp = 0;
-static int g_humidity = 0;
-static int g_light = 0;
-
-/* 从字符串中提取 key= 后面的数值 */
-static int get_val(const char* str, const char* key) {
-    const char* p;
-    int val = 0;
-    p = strstr(str, key);
-    if (p == NULL) return -1;
-    p += strlen(key);
-    while (*p >= '0' && *p <= '9') {
-        val = val * 10 + (*p - '0');
-        p++;
-    }
-    return val;
+/* 获取随机退避时间 */
+unsigned int getRandomDelay(void) {
+    static unsigned int seed = 0x4102;
+    seed = (seed * 1103515245 + 12345) & 0x7FFF;
+    return seed;
 }
 
-// 串口接收中断函数
+/* 读取CC2530的64位IEEE MAC地址，地址 0x780C~0x7813 */
+void readMacAddress(uint8* macAddr) {
+    uint8 i;
+    uint8 * flashPtr = (uint8 *)(P_INFOPAGE + 0x0C);
+    for (i = 0; i < 8; i++) {
+        macAddr[i] = flashPtr[i];
+    }
+}
 
+/* CSMA-CA：指数退避（≤150ms后封顶12次重试，最大间隔≤151ms＜200ms RX窗） */
+uint8 csmaCaSendPacket(uint16 destAddr, uint8* pPayload, uint8 length) {
+    uint8 retries = 0;
+    while (retries < 12) {
+        uint32 backoff;
+        if (retries < 5) {
+            backoff = (getRandomDelay() % (1 << retries)) * 10;  // 0~10~20~40~80ms
+        } else {
+            backoff = (getRandomDelay() % 17) * 10;               // 0~160ms 封顶
+        }
+        halMcuWaitMs(backoff);
+        if (basicRfSendPacket(destAddr, pPayload, length) == SUCCESS) {
+            return SUCCESS;
+        }
+        retries++;
+    }
+    return FAILED;
+}
+
+/* 发送无线控制指令到指定节点（通用） */
+void sendWirelessCmd(uint16 targetAddr, char* cmd) {
+    uint8 result;
+    basicRfReceiveOff();
+    result = csmaCaSendPacket(targetAddr, (uint8*)cmd, strlen(cmd) + 1);
+    basicRfReceiveOn();
+    if (result == SUCCESS) {
+        printf("{cmd=%s->0x%04X}\r\n", cmd, targetAddr);
+    } else {
+        printf("{cmd=FAIL->0x%04X}\r\n", targetAddr);
+    }
+}
+
+/* 发送LED控制指令 */
+void sendLedCmd(uint16 targetAddr, uint8 on) {
+    char cmd[10];
+    sprintf(cmd, "{LED=%d}", on);
+    sendWirelessCmd(targetAddr, cmd);
+}
+
+/* 发送数据采集控制指令 */
+void sendDataCmd(uint16 targetAddr, uint8 on) {
+    char cmd[10];
+    sprintf(cmd, "{SEND=%d}", on);
+    sendWirelessCmd(targetAddr, cmd);
+}
+
+// 无线控制命令标志（ISR只设标志，主循环处理）
+volatile uint8  cmdPending = 0;
+volatile uint16 cmdTarget  = 0;
+volatile uint8  cmdOn      = 0;
+
+// 串口接收中断函数（只设标志位，不阻塞）
 #pragma vector = URX0_VECTOR
 __interrupt void UART0_ISR(void)
 {
   uchar rx_data;
-  
-  URX0IF = 0;  // 清除接收中断标志
-  rx_data = U0DBUF;  // 读取接收到的数据
 
-  // 指令接收逻辑
+  URX0IF = 0;
+  rx_data = U0DBUF;
+
   switch (rx_data) {
-    case '@':  // 单字符命令: @ 控制LED点亮
-      D7 = 0;  // 低电平点亮D7
-      
-      break;
-    case '!':  // 单字符命令: # 控制LED熄灭
-      D7 = 1;  // 高电平熄灭D7
-      
-      break;
-    default:  // 无效命令
-     
-      break;
+    case '@':  D7 = 0;  break;                     // 本地D7亮
+    case '!':  D7 = 1;  break;                     // 本地D7灭
+    case '1':  cmdTarget = DHT11_ADDR; cmdOn = 1; cmdPending = 1;  break;
+    case '2':  cmdTarget = DHT11_ADDR; cmdOn = 0; cmdPending = 1;  break;
+    case '3':  cmdTarget = PHOTO_ADDR; cmdOn = 1; cmdPending = 1;  break;
+    case '4':  cmdTarget = PHOTO_ADDR; cmdOn = 0; cmdPending = 1;  break;
+    case '5':  cmdTarget = DHT11_ADDR; cmdOn = 1; cmdPending = 2;  break;  // 2=数据采集控制
+    case '6':  cmdTarget = DHT11_ADDR; cmdOn = 0; cmdPending = 2;  break;
+    case '7':  cmdTarget = PHOTO_ADDR; cmdOn = 1; cmdPending = 2;  break;
+    case '8':  cmdTarget = PHOTO_ADDR; cmdOn = 0; cmdPending = 2;  break;
+    default:  break;
   }
 }
 
-/* 射频模块接收数据函数 — 数据融合 */
+/* 射频模块接收数据函数 — 双标志位触发本机状态打印 */
 void rfRecvData(void)
 {
     char pRxData[128];
+    uint8 macAddr[8];
     int rlen;
-
-    // Main loop
+    uint8 dht11Flag = 0;    // DHT11节点数据接收标志
+    uint8 photoFlag = 0;    // 光敏节点数据接收标志
+    
+    // 读取本机MAC地址
+    readMacAddress(macAddr);
+    
+    basicRfReceiveOn();
+    printf("{data=recv node start up...}");
+    
     while (TRUE) {
-        // 非阻塞式检查是否有无线数据包
-        if (basicRfPacketIsReady()) {
-            rlen = basicRfReceive(pRxData, sizeof pRxData, NULL);
-            if(rlen > 0) {
-              pRxData[rlen] = 0;
-              
-              // 判断数据类型并更新对应的全局变量
-              if (strstr(pRxData, "Humidity") != NULL) {
-                  // 温湿度数据: {Humidity=xx, Temp=xx}
-                  g_humidity = get_val(pRxData, "Humidity=");
-                  g_temp = get_val(pRxData, "Temp=");
-              } else if (strstr(pRxData, "Light") != NULL) {
-                  // 光照数据: {Light=xx}
-                  g_light = get_val(pRxData, "Light=");
-              }
-              
-              // 一次打印融合后的所有数据 + LED状态
-              printf("{Temp=%d, Humidity=%d, Light=%d, D7=%d}\r\n",
-                     g_temp, g_humidity, g_light, (D7 == 0) ? 1 : 0);
+        // 处理无线控制命令（cmdPending: 1=LED控制, 2=数据采集控制）
+        if (cmdPending) {
+            uint8 type = cmdPending;
+            uint16 target = cmdTarget;
+            uint8 on = cmdOn;
+            cmdPending = 0;
+            if (type == 2) {
+                sendDataCmd(target, on);
+            } else {
+                sendLedCmd(target, on);
             }
         }
+        
+        if (basicRfPacketIsReady()) {
+            rlen = basicRfReceive((uint8*)pRxData, sizeof pRxData, NULL);
+            if (rlen > 0) {
+                pRxData[rlen] = 0;
+                
+                // 识别数据来源，置位对应标志
+                if (strstr(pRxData, "Humidity") != NULL) {
+                    dht11Flag = 1;
+                } else if (strstr(pRxData, "Light") != NULL) {
+                    photoFlag = 1;
+                }
+                
+                // 直接打印收到的传感器数据
+                printf("%s\r\n", pRxData);
+                
+                // 两个节点数据都收到后，立即打印本机状态
+                if (dht11Flag && photoFlag) {
+                    printf("{D=%d, MAC=%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X}\r\n",
+                           (D7 == 0) ? 1 : 0,
+                           macAddr[7], macAddr[6], macAddr[5], macAddr[4],
+                           macAddr[3], macAddr[2], macAddr[1], macAddr[0]);
+                    // 重置标志，进入下一轮
+                    dht11Flag = 0;
+                    photoFlag = 0;
+                }
+            }
+        }
+        
+        halMcuWaitMs(10);
     }
 }
 
@@ -99,9 +176,6 @@ void main(void)
     led_init();                                                 //初始化LED
     uart0_init(0x00, 0x00);                                     //初始化串口波特率为38400
     lcd_dis();                                                  //在LCD上显示相关信息
-// 确保中断已开启
-    EA = 1;  // 全局中断使能
-    URX0IE = 1;  // UART0接收中断使能
     
     if (FAILED == halRfInit()) {                                // halRfInit()为射频初始化函数
         HAL_ASSERT(FALSE);
@@ -116,16 +190,13 @@ void main(void)
 
     
     // Initialize BasicRF
-    basicRfConfig.myAddr = RECV_ADDR;                          //接收地址
+    basicRfConfig.myAddr = MY_ADDR;                             //设置本机地址
     
     if(basicRfInit(&basicRfConfig)==FAILED) {
       HAL_ASSERT(FALSE);
     }
     
-    basicRfReceiveOn();                                         //打开射频接收器
-    printf("{data=recv node start up...}");
-    
-    // 调用rfRecvData函数处理无线接收
+    // 调用rfRecvData函数处理无线接收（内部完成接收器初始化和MAC读取）
     rfRecvData();
 }
 

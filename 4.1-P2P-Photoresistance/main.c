@@ -124,13 +124,13 @@ void halWait(unsigned char wait)
   return;
 }
 
-/* 光敏电阻测试函数 */
+/* 光敏电阻测试函数（LCD显示屏用，保持 {A0=} 格式兼容） */
 void Photoresistance_Test(void)
 {
   int AdcValue;  
   AdcValue = getADC();
  
-  //在LCD上发送光敏电阻值
+  //在串口/LCD上发送光照值（{A0=} 格式兼容LCD显示屏解析）
   char  dbuf[20] = {0};
   sprintf(dbuf,"{A0=%d}",AdcValue);
   Uart_Send_String(dbuf);
@@ -146,71 +146,90 @@ unsigned int getRandomDelay(void) {
     return seed;
 }
 
-/* CSMA-CA 算法使用二进制退避 */
+/* 读取CC2530的64位IEEE MAC地址，地址 0x780C~0x7813 */
+void readMacAddress(uint8* macAddr) {
+    uint8 i;
+    uint8 * flashPtr = (uint8 *)(P_INFOPAGE + 0x0C);
+    for (i = 0; i < 8; i++) {
+        macAddr[i] = flashPtr[i];
+    }
+}
+
+/* CSMA-CA 精简版：指数退避 + 硬件CCA（basicRfSendPacket内置） */
 uint8 csmaCaSendPacket(uint16 destAddr, uint8* pPayload, uint8 length) {
-    uint8 ret;
-    uint8 maxRetries = 7; // 最大重试次数
     uint8 retries = 0;
-    uint8 ccaAttempts = 0;
-    uint32 backoffTime;
-    
-    while (retries < maxRetries) {
-        // 1. 二进制退避
-        // 退避时间 = 随机数 % (2^(min(retries, 10)) * 20ms)
-        // 当重试次数超过10时，退避时间保持在2^10 * 20ms
-        uint8 exponent = (retries < 10) ? retries : 10;
-        uint32 backoffSlots = (1 << exponent); // 2^exponent
-        uint32 randomSlot = getRandomDelay() % backoffSlots;
-        backoffTime = randomSlot * 20; // 每个时隙20ms
-        halMcuWaitMs(backoffTime);
-        
-        // 2. 载波侦听（多次检查，提高可靠性）
-        ccaAttempts = 0;
-        while (ccaAttempts < 3) {
-            // 检查信道是否空闲（使用basicRF的内置CCA机制）
-            halMcuWaitMs(5);
-            ccaAttempts++;
-        }
-        
-        // 3. 发送数据包
-        ret = basicRfSendPacket(destAddr, pPayload, length);
-        if (ret == SUCCESS) {
+    while (retries < 5) {
+        uint32 backoff = (getRandomDelay() % (1 << retries)) * 10;
+        halMcuWaitMs(backoff);
+        if (basicRfSendPacket(destAddr, pPayload, length) == SUCCESS) {
             return SUCCESS;
         }
-        
         retries++;
     }
-    
     return FAILED;
 }
 
-/* 射频模块发送数据函数 */
-void rfSendData(void){                                          //发送函数
-    char pTxData[30];
+/* 射频模块发送数据函数（含MAC地址 + RX监听窗口 + 数据采集开关） */
+void rfSendData(void){
+    char pTxData[70];
+    uint8 pRxData[16];
+    uint8 macAddr[8];
     uint8 ret;
+    int rlen;
     int AdcValue;
-    // Keep Receiver off when not needed to save power
-    basicRfReceiveOff();                                        //关闭射频接收器
-    // Main loop
+    uint8 sendEnable = 1;    // 数据采集开关: 1=发送, 0=暂停
+    
+    // 启动时读取本机MAC地址（只读一次）
+    readMacAddress(macAddr);
+    
+    basicRfReceiveOff();
+    
     while (TRUE) {
-      AdcValue = getADC();
-      sprintf(pTxData, "{A0=%d}", AdcValue);
-      //在LCD上显示数据
-      Photoresistance_Test();
-      //向节点发送数据包  
-      ret = csmaCaSendPacket(RECV_ADDR, (uint8*)pTxData, strlen(pTxData) + 1); 
-      if (ret == SUCCESS) {
-        hal_led_on(1);
-        halMcuWaitMs(100);
-        hal_led_off(1);
-        halMcuWaitMs(900); // 增加延迟，降低发送频率，恢复到原来的1秒间隔
-      } else {
-        hal_led_on(1);
-        halMcuWaitMs(500);
-        hal_led_off(1);
-        halMcuWaitMs(500); // 增加失败后的延迟，降低重试频率
-      }
-      
+        // === 阶段1：采集并发送光照数据（sendEnable=0时跳过） ===
+        if (sendEnable) {
+            AdcValue = getADC();
+            Photoresistance_Test();  // LCD/串口打印 {A0=%d}
+            sprintf(pTxData, "{Light=%d, D=%d, MAC=%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X}",
+                    AdcValue,
+                    (D7 == 0) ? 1 : 0,
+                    macAddr[7], macAddr[6], macAddr[5], macAddr[4],
+                    macAddr[3], macAddr[2], macAddr[1], macAddr[0]);
+            
+            ret = csmaCaSendPacket(RECV_ADDR, (uint8*)pTxData, strlen(pTxData) + 1);
+            if (ret == SUCCESS) {
+                D6 = 0;       // D6 闪烁表示发送成功
+                halMcuWaitMs(100);
+                D6 = 1;
+            }
+        }
+        
+        // === 阶段2：RX监听窗口（200ms，接收控制指令） ===
+        basicRfReceiveOn();
+        halMcuWaitMs(200);
+        
+        if (basicRfPacketIsReady()) {
+            rlen = basicRfReceive(pRxData, sizeof pRxData, NULL);
+            if (rlen > 0) {
+                pRxData[rlen] = 0;
+                if (strstr((char*)pRxData, "LED=1")) {
+                    D7 = 0;
+                    printf("{cmd=LED ON}\r\n");
+                } else if (strstr((char*)pRxData, "LED=0")) {
+                    D7 = 1;
+                    printf("{cmd=LED OFF}\r\n");
+                } else if (strstr((char*)pRxData, "SEND=1")) {
+                    sendEnable = 1;
+                    printf("{cmd=SEND ON}\r\n");
+                } else if (strstr((char*)pRxData, "SEND=0")) {
+                    sendEnable = 0;
+                    printf("{cmd=SEND OFF}\r\n");
+                }
+            }
+        }
+        basicRfReceiveOff();
+        
+        // === 阶段3：等待下个周期（总周期约1秒） ===
+        halMcuWaitMs(700);
     }
 }
 
