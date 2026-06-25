@@ -12,12 +12,16 @@
 
 #define RF_CHANNEL            24                                // 2.4 GHz RF channel
 #define PAN_ID                0x1410                            // 班级
-#define SEND_ADDR             0x4101                            // 学号
-#define RECV_ADDR             0x4102                         // 学号
 
 #define NODE_TYPE             1                                //0:接收节点，1：发送节点
 
 static basicRfCfg_t basicRfConfig;
+
+// === v3.0 动态地址 ===
+uint16 myRecvAddr = 0;
+uint8  registered = 0;
+char   myMacStr[24];
+uint8  lastBeaconCh = RF_CHANNEL;  // P1-8：缓存上次信标信道，加速重试
 
 int getADC(void);
 
@@ -125,11 +129,8 @@ void halWait(unsigned char wait)
 }
 
 /* 光敏电阻测试函数（LCD显示屏用，保持 {A0=} 格式兼容） */
-void Photoresistance_Test(void)
+void Photoresistance_Test(int AdcValue)
 {
-  int AdcValue;  
-  AdcValue = getADC();
- 
   //在串口/LCD上发送光照值（{A0=} 格式兼容LCD显示屏解析）
   char  dbuf[20] = {0};
   sprintf(dbuf,"{A0=%d}",AdcValue);
@@ -137,13 +138,19 @@ void Photoresistance_Test(void)
   
 }
 
+/* 随机种子：从本机 MAC 派生，确保每个节点退避序列不同（P0-1 修复） */
+static uint16 randSeed = 0;
+
+/* 用 MAC 地址初始化随机种子（在 readMacAddress 后调用一次） */
+void rand_init(uint8* macAddr) {
+    randSeed = ((uint16)macAddr[0] << 8) | macAddr[1];
+    if (randSeed == 0) randSeed = 0x4101;   // 避免 0 种子导致退避序列退化
+}
+
 /* 获取随机退避时间 */
 unsigned int getRandomDelay(void) {
-    // 简单的伪随机数生成，基于系统时钟
-    // 使用不同的初始种子，确保每个节点的退避序列不同
-    static unsigned int seed = 0x4101; // 使用发送地址作为初始种子，确保唯一性
-    seed = (seed * 1103515245 + 12345) & 0x7FFF;
-    return seed;
+    randSeed = (randSeed * 1103515245 + 12345) & 0x7FFF;
+    return randSeed;
 }
 
 /* 读取CC2530的64位IEEE MAC地址，地址 0x780C~0x7813 */
@@ -153,6 +160,49 @@ void readMacAddress(uint8* macAddr) {
     for (i = 0; i < 8; i++) {
         macAddr[i] = flashPtr[i];
     }
+}
+
+/* 前向声明 */
+uint8 csmaCaSendPacket(uint16 destAddr, uint8* pPayload, uint8 length);
+
+/* 信道扫描 + 信标发现 + 注册 */
+void doRegister(void) {
+    uint8 ch;
+    uint8 tried;
+    char rxBuf[32];
+    int rlen;
+    // P1-8：从上次成功信道开始轮转扫描，加速注册（默认 RF_CHANNEL）
+    for (tried = 0; tried < 16; tried++) {
+        ch = 11 + ((lastBeaconCh - 11 + tried) % 16);
+        halRfSetChannel(ch);
+        halRfReceiveOn();
+        halMcuWaitMs(50);
+        if (basicRfPacketIsReady()) {
+            rlen = basicRfReceive((uint8*)rxBuf, sizeof(rxBuf), NULL);
+            if (rlen > 0 && rlen < sizeof(rxBuf)) {
+                rxBuf[rlen] = 0;
+                if (strstr(rxBuf, "TYPE=RECV")) {
+                    myRecvAddr = basicRfReceiveAddress();
+                    lastBeaconCh = ch;    // 记住信标信道，下次加速
+                    halRfSetChannel(ch);
+                    char reg[50];
+                    uint8 regResult;
+                    sprintf(reg, "{REG=MAC:%s}", myMacStr);
+                    regResult = csmaCaSendPacket(myRecvAddr, (uint8*)reg, strlen(reg) + 1);
+                    if (regResult == SUCCESS) {
+                        registered = 1;
+                        printf("{reg=OK, MAC=%s}\r\n", myMacStr);
+                    } else {
+                        printf("{reg=RETRY}\r\n");
+                    }
+                    return;
+                }
+            }
+        }
+        halRfReceiveOff();
+    }
+    printf("{reg=FAIL}\r\n");
+    halRfSetChannel(RF_CHANNEL);   // P1-13：切回默认信道，避免 RX 窗口在 ch=26 空转
 }
 
 /* CSMA-CA 精简版：指数退避 + 硬件CCA（basicRfSendPacket内置） */
@@ -172,64 +222,91 @@ uint8 csmaCaSendPacket(uint16 destAddr, uint8* pPayload, uint8 length) {
 /* 射频模块发送数据函数（含MAC地址 + RX监听窗口 + 数据采集开关） */
 void rfSendData(void){
     char pTxData[70];
-    uint8 pRxData[16];
+    uint8 pRxData[64];
     uint8 macAddr[8];
     uint8 ret;
     int rlen;
     int AdcValue;
     uint8 sendEnable = 1;    // 数据采集开关: 1=发送, 0=暂停
     
-    // 启动时读取本机MAC地址（只读一次）
+    // 启动时读取本机MAC地址（只读一次，后续直接用缓存）
     readMacAddress(macAddr);
+    rand_init(macAddr);              // P0-1：从 MAC 派生随机种子
+
+    // 生成 MAC 字符串 + 注册（短地址保持 0x0001 统一占位，节点识别依赖 payload MAC）
+    sprintf(myMacStr, "%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X",
+            macAddr[7], macAddr[6], macAddr[5], macAddr[4],
+            macAddr[3], macAddr[2], macAddr[1], macAddr[0]);
+    doRegister();
     
     basicRfReceiveOff();
     
     while (TRUE) {
-        // === 阶段1：采集并发送光照数据（sendEnable=0时跳过） ===
-        if (sendEnable) {
+        // === 阶段1：采集并发送光照数据（sendEnable=0 或 未注册时跳过） ===
+        if (sendEnable && registered) {
             AdcValue = getADC();
-            Photoresistance_Test();  // LCD/串口打印 {A0=%d}
+            Photoresistance_Test(AdcValue);  // LCD/串口打印 {A0=%d}
             sprintf(pTxData, "{Light=%d, D=%d, MAC=%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X}",
                     AdcValue,
                     (D7 == 0) ? 1 : 0,
                     macAddr[7], macAddr[6], macAddr[5], macAddr[4],
                     macAddr[3], macAddr[2], macAddr[1], macAddr[0]);
             
-            ret = csmaCaSendPacket(RECV_ADDR, (uint8*)pTxData, strlen(pTxData) + 1);
+            ret = csmaCaSendPacket(myRecvAddr, (uint8*)pTxData, strlen(pTxData) + 1);
             if (ret == SUCCESS) {
-                D6 = 0;       // D6 闪烁表示发送成功
-                halMcuWaitMs(100);
+                D6 = 0;       // P1-14：D6 短闪 50ms 表示正在发送数据
+                halMcuWaitMs(50);
                 D6 = 1;
             }
         }
         
-        // === 阶段2：RX监听窗口（200ms，接收控制指令） ===
+        // === 阶段2：RX监听窗口（900ms，接收控制指令，MAC 自比对） ===
         basicRfReceiveOn();
-        halMcuWaitMs(200);
-        
-        if (basicRfPacketIsReady()) {
-            rlen = basicRfReceive(pRxData, sizeof pRxData, NULL);
-            if (rlen > 0) {
+        halMcuWaitMs(900);
+
+        // P1-7：循环处理多个包，避免连续指令丢失
+        while (basicRfPacketIsReady()) {
+            rlen = basicRfReceive(pRxData, sizeof(pRxData), NULL);
+            if (rlen > 0 && rlen < sizeof(pRxData)) {
                 pRxData[rlen] = 0;
-                if (strstr((char*)pRxData, "LED=1")) {
-                    D7 = 0;
-                    printf("{cmd=LED ON}\r\n");
-                } else if (strstr((char*)pRxData, "LED=0")) {
-                    D7 = 1;
-                    printf("{cmd=LED OFF}\r\n");
-                } else if (strstr((char*)pRxData, "SEND=1")) {
-                    sendEnable = 1;
-                    printf("{cmd=SEND ON}\r\n");
-                } else if (strstr((char*)pRxData, "SEND=0")) {
-                    sendEnable = 0;
-                    printf("{cmd=SEND OFF}\r\n");
+                // MAC 比对：只响应发给本节点的指令
+                // P0-6：未注册时不响应指令（myRecvAddr=0，ACK 会发到地址 0 导致丢包）
+                if (registered && strstr((char*)pRxData, myMacStr)) {
+                    char ack[60] = {0};
+                    if (strstr((char*)pRxData, "LED=1")) {
+                        D7 = 0;
+                        printf("{cmd=LED ON}\r\n");
+                        sprintf(ack, "{CMD=SUCCESS, LED=1, MAC=%s}", myMacStr);
+                    } else if (strstr((char*)pRxData, "LED=0")) {
+                        D7 = 1;
+                        printf("{cmd=LED OFF}\r\n");
+                        sprintf(ack, "{CMD=SUCCESS, LED=0, MAC=%s}", myMacStr);
+                    } else if (strstr((char*)pRxData, "STATUS=1")) {
+                        sendEnable = 1;
+                        printf("{cmd=STATUS ON}\r\n");
+                        sprintf(ack, "{CMD=SUCCESS, STATUS=1, MAC=%s}", myMacStr);
+                    } else if (strstr((char*)pRxData, "STATUS=0")) {
+                        sendEnable = 0;
+                        printf("{cmd=STATUS OFF}\r\n");
+                        sprintf(ack, "{CMD=SUCCESS, STATUS=0, MAC=%s}", myMacStr);
+                    }
+                    if (ack[0]) {
+                        basicRfReceiveOff();
+                        basicRfConfig.ackRequest = FALSE;    // P1-11：ACK 包无需接收节点再回硬件 ACK
+                        csmaCaSendPacket(myRecvAddr, (uint8*)ack, strlen(ack) + 1);
+                        basicRfConfig.ackRequest = TRUE;     // 恢复
+                        basicRfReceiveOn();
+                    }
                 }
             }
         }
         basicRfReceiveOff();
         
-        // === 阶段3：等待下个周期（总周期约1秒） ===
-        halMcuWaitMs(700);
+        // 未注册则重试，成功后恢复数据发送
+        if (!registered) { 
+            doRegister();
+            if (registered) { sendEnable = 1; }
+        }
     }
 }
 
@@ -275,12 +352,8 @@ void main(void)
 #endif
 
     
-    // Initialize BasicRF
-#if NODE_TYPE
-    basicRfConfig.myAddr = SEND_ADDR;                          //发送地址
-#else
-    basicRfConfig.myAddr = RECV_ADDR;                          //接收地址
-#endif
+    // Initialize BasicRF（短地址统一 0x0001 占位，节点识别依赖 payload MAC 字符串）
+    basicRfConfig.myAddr = 0x0001;
     
     if(basicRfInit(&basicRfConfig)==FAILED) {
       HAL_ASSERT(FALSE);
