@@ -20,6 +20,9 @@ static basicRfCfg_t basicRfConfig;
 // === RF 接收缓冲（全局，避免 128 字节数组占用 xdata 栈导致栈溢出） ===
 char gRxData[128];
 
+// === ISR 专用全局变量（避免 __interrupt 函数局部变量在 xdata 栈上分配/释放不对称导致栈泄漏） ===
+volatile char gUartRxBuf;    // UART0_ISR 专用
+
 // === 串口指令环形缓冲 ===
 #define CMD_BUF_SIZE 64
 char cmdBuf[CMD_BUF_SIZE];
@@ -56,15 +59,14 @@ void broadcastCmd(char* cmd) {
 #pragma vector = URX0_VECTOR
 __interrupt void UART0_ISR(void)
 {
-    char c;
     URX0IF = 0;
-    c = U0DBUF;
-    if (c == '@') { D7 = 0; return; }
-    if (c == '!') { D7 = 1; return; }
-    if (c == '{' || cmdIdx > 0) {
+    gUartRxBuf = U0DBUF;
+    if (gUartRxBuf == '@') { D7 = 0; return; }
+    if (gUartRxBuf == '!') { D7 = 1; return; }
+    if (gUartRxBuf == '{' || cmdIdx > 0) {
         if (cmdIdx < CMD_BUF_SIZE - 1) {
-            cmdBuf[cmdIdx++] = c;
-            if (c == '}') { cmdBuf[cmdIdx] = '\0'; cmdReady = 1; cmdIdx = 0; }
+            cmdBuf[cmdIdx++] = gUartRxBuf;
+            if (gUartRxBuf == '}') { cmdBuf[cmdIdx] = '\0'; cmdReady = 1; cmdIdx = 0; }
         } else {
             cmdIdx = 0;            // 溢出保护
             cmdOverflow = 1;      // P1-10：置溢出标志，主循环打印提示

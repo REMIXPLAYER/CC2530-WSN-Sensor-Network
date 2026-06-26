@@ -133,6 +133,9 @@ static ISR_FUNC_PTR pfISR= NULL;
 #endif
 static uint8 rssiOffset = RSSI_OFFSET;
 
+// ISR 专用全局变量（避免 __interrupt 函数局部变量在 xdata 栈上分配/释放不对称导致栈泄漏）
+volatile uint8 gRfIntState;    // rfIsr 的 HAL_INT_LOCK 专用
+
 /***********************************************************************************
 * LOCAL FUNCTIONS
 */
@@ -590,9 +593,7 @@ void halRfWaitTransceiverReady(void)
 */
 HAL_ISR_FUNCTION( rfIsr, RF_VECTOR )
 {
-    uint8 x;
-
-    HAL_INT_LOCK(x);
+    HAL_INT_LOCK(gRfIntState);
 
     if( RFIRQF0 & IRQ_RXPKTDONE )
     {
@@ -602,7 +603,7 @@ HAL_ISR_FUNCTION( rfIsr, RF_VECTOR )
         S1CON= 0;                   // Clear general RF interrupt flag
         RFIRQF0&= ~IRQ_RXPKTDONE;   // Clear RXPKTDONE interrupt
     }
-    HAL_INT_UNLOCK(x);
+    HAL_INT_UNLOCK(gRfIntState);
 }
 #endif
 
