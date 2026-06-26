@@ -246,8 +246,8 @@ static void basicRfRxFrmDoneIsr(void)
     // Clear interrupt and disable new RX frame done interrupt
     halRfDisableRxInterrupt();
 
-    // Enable all other interrupt sources (enables interrupt nesting)
-    halIntOn();
+    // 不再开启中断嵌套：原 halIntOn() 允许 UART 等中断在 RF 处理期间打断，
+    // 导致 xdata 栈叠加溢出 → CPU 跑飞。RF 处理仅几十微秒，关中断可接受。
 
     // Read payload length.
     halRfReadRxBuf(&pHdr->packetLength,1);

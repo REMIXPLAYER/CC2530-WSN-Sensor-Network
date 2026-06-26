@@ -260,6 +260,64 @@
 
 ---
 
+## 稳定性与防御性设计
+
+为解决长时间运行后节点死机、`@` 指令无响应、重启采集节点后无法注册等问题，v3.0 在原有业务修复基础上补充以下防御性修复（commit `887a881` + `9db3a34`）。
+
+### RF 状态机超时与自愈（`hal_rf.c`，三个项目）
+
+`halRfTransmit` 的 `while(!TXDONE)` 与 `halRfWaitTransceiverReady` 的 `while(FSMSTAT1 & ...)` 原本无超时，RF 状态机偶发挂起时进入永久死循环，导致信标/数据包发不出，传感器表现为"重启采集节点后 reg=FAIL，重启接收节点才能注册"。
+
+修复策略：
+- `while` 循环加 `++to < 20000` 超时退出
+- 超时后执行 `ISFLUSHTX + ISRFOFF + ISFLUSHRX + ISRXON` 重置 RF 状态机并恢复 RX，避免 RF 一直卡死后信标永久发不出
+
+### doRegister RF 状态保护（DHT11 + 光敏 `main.c`）
+
+阶段1 用 `halRfReceiveOn/Off`（HAL 层）不会设置 `txState.receiveOn`，导致 `basicRfSendPacket` 发完 REG 包后调 `halRfReceiveOff`，重新 `halRfReceiveOn` 时 `ISFLUSHRX` 清空 RX FIFO，可能丢掉紧随其后的下一个信标。
+
+修复：改用 `basicRfReceiveOn/Off`（BASIC_RF 层），设置 `txState.receiveOn=TRUE`，`basicRfSendPacket` 发完不再关 RX，避免 `ISFLUSHRX` 丢包。同时 REG 失败后不 `return`，继续循环等下一个信标重试。
+
+### DHT11 通信超时保护（DHT11 `main.c`）
+
+`dht11_read_bit` 的 `while(!COM_R)` 无超时，传感器异常（数据线卡低）时永久死循环死机。
+
+修复：
+- `while` 加 `++to < 500` 超时退出
+- 全局 `dht11TimedOut` 标志传播到 `dht11_read_byte` 与 `dht11_update`，超时时中断读取并保留上次有效数据，不更新 `sTemp/sHumidity`
+
+### `tried` 循环计数器溢出修复（DHT11 + 光敏 `main.c`）
+
+`doRegister` 阶段1 用 `uint8 tried < 350`，但 `uint8` 范围 0–255，比较永远为 `true` → 阶段1 永久死循环 → 节点死机。光敏节点 IAR 编译警告 `Warning[Pa084]: pointless integer comparison, the result is always true` 即此问题。
+
+修复：`uint8 tried` → `uint16 tried`
+
+### `Uart_Recv_char` 死代码清理（三个项目）
+
+`Uart_Recv_char` 从未被调用，但 IAR banked code model 会为所有函数（含死代码）生成 `?relay` 中转入口，与 `main.c` 中的实体定义冲突，导致链接错误：
+
+```
+Error[e27]: Entry "Uart_Recv_char::?relay" in module basic_rf redefined in module main
+```
+
+修复：删除 `Uart_Recv_char` 的定义（`main.c` / `uart.c`）和声明（`uart.h`）。已通过 grep 确认无任何调用、函数指针引用或 `extern` 声明。
+
+### idata 栈扩容（三个项目 `p2p.ewp`）
+
+IAR 默认 idata 栈仅 64 字节（`0x40`），中断嵌套（`rfIsr` + `basicRfRxFrmDoneIsr` + `UART0_ISR`）溢出，烧录时 IAR 调试器警告 `Possible IDATA stack overflow detected`。
+
+修复：Idata Stack Size `0x40` → `0x80`（128 字节）。
+
+> Extended Stack（xdata 511 字节）无法启用：勾选后 IAR 7.0 报错 `Error[e12]: Unable to open cl-ple-blpd-1e16x01.r51`，本机安装缺少对应 CLIB 变体。改用 idata 栈扩容 + 代码层防御。
+
+### 接收节点中断状态防御性恢复（接收 `main.c`）
+
+idata 栈溢出会破坏 `HAL_INT_LOCK(x)` 保存的 `EA` 值，`HAL_INT_UNLOCK(x)` 恢复时 `EA=0` → 全局中断永久关闭 → `@` 指令无响应（UART RX 中断不触发，但 `rx` 计数器仍跳动能收到字节）。
+
+修复：主循环每轮强制 `EA = 1; URX0IE = 1;` 防御性恢复中断使能，即使保存值被破坏也能自愈。
+
+---
+
 ## LED 引脚
 
 | 丝印 | 引脚 | 逻辑 | 用途 |
@@ -277,6 +335,16 @@
 4. 串口 38400 查看输出
 
 编译警告 `basic_rf.c:517/544` 为 TI 库固有，可忽略。
+
+### idata 栈大小设置（IAR GUI）
+
+三个项目的 `p2p.ewp` 已配置 `Idata Stack Size = 0x80`（128 字节，默认仅 0x40=64 字节会触发 `Possible IDATA stack overflow detected` 警告）。如需在 IAR GUI 修改：`Project → Options... → General Options → Stack/Heap → Idata stack size`，填 `0x80`。
+
+> Extended Stack 选项（`Project → Options... → General Options → Stack/Heap → Enable extended stack`）**不要勾选**：本机 IAR 7.0 缺少对应 CLIB 库（`cl-ple-blpd-1e16x01.r51`），勾选后链接报错 `Error[e12]`。
+
+### 死代码与 `?relay` 链接错误
+
+IAR banked code model 会为所有函数（含从未被调用的死代码）生成 `?relay` 中转入口。若 `uart.c` 与 `main.c` 同时定义同名函数，链接时冲突报 `Error[e27]: ...?relay redefined`。已删除三个项目中的 `Uart_Recv_char` 死代码（定义 + 声明）。新增 UART 函数时，**只在一个 `.c` 中定义，其余文件通过 `extern` 或头文件声明**，避免重复定义。
 
 ---
 

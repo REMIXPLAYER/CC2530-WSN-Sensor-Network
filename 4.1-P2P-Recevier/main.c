@@ -17,6 +17,9 @@
 
 static basicRfCfg_t basicRfConfig;
 
+// === RF 接收缓冲（全局，避免 128 字节数组占用 xdata 栈导致栈溢出） ===
+char gRxData[128];
+
 // === 串口指令环形缓冲 ===
 #define CMD_BUF_SIZE 64
 char cmdBuf[CMD_BUF_SIZE];
@@ -72,7 +75,6 @@ __interrupt void UART0_ISR(void)
 /* 射频模块接收数据函数 — 纯透传 + 信标广播 */
 void rfRecvData(void)
 {
-    char pRxData[128];
     int rlen;
     unsigned int loopCounter = 0;   // P1-12：基于循环计数，容忍 broadcastCmd 50ms 等耗时漂移
     
@@ -90,10 +92,10 @@ void rfRecvData(void)
         if (cmdOverflow) { cmdOverflow = 0; printf("{err=cmd overflow}\r\n"); }
         
         if (basicRfPacketIsReady()) {
-            rlen = basicRfReceive((uint8*)pRxData, sizeof(pRxData), NULL);
-            if (rlen > 0 && rlen < sizeof(pRxData)) {
-                pRxData[rlen] = 0;
-                printf("%s\r\n", pRxData);
+            rlen = basicRfReceive((uint8*)gRxData, sizeof(gRxData), NULL);
+            if (rlen > 0 && rlen < sizeof(gRxData)) {
+                gRxData[rlen] = 0;
+                printf("%s\r\n", gRxData);
             }
         }
         

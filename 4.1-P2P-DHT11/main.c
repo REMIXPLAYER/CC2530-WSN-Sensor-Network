@@ -48,6 +48,9 @@ uint8  registered = 0;       // 注册状态
 char   myMacStr[24];         // 本机 MAC 字符串
 uint8  lastBeaconCh = RF_CHANNEL;  // P1-8：缓存上次信标信道，加速重试
 
+// RF 接收缓冲（全局，避免 64 字节数组占用 xdata 栈导致栈溢出）
+uint8 gRxData[64];
+
 /* 随机种子：从本机 MAC 派生，确保每个节点退避序列不同（P0-1 修复） */
 static uint16 randSeed = 0;
 
@@ -170,7 +173,6 @@ uint8 csmaCaSendPacket(uint16 destAddr, uint8* pPayload, uint8 length) {
 /* 射频模块发送数据函数（含MAC地址 + 信标注册 + RX监听窗口 + STATUS采集开关） */
 void rfSendData(void){
     char pTxData[80];
-    uint8 pRxData[64];
     uint8 macAddr[8];
     uint8 ret;
     int rlen;
@@ -224,26 +226,26 @@ void rfSendData(void){
                 halMcuWaitMs(10);
                 // P1-7 + 业务缺陷1修复：分片轮询及时取包，避免阻塞期间 rxCallback 覆盖未读的 rxi
                 while (basicRfPacketIsReady()) {
-                    rlen = basicRfReceive(pRxData, sizeof(pRxData), NULL);
-                    if (rlen > 0 && rlen < sizeof(pRxData)) {
-                        pRxData[rlen] = 0;
+                    rlen = basicRfReceive(gRxData, sizeof(gRxData), NULL);
+                    if (rlen > 0 && rlen < sizeof(gRxData)) {
+                        gRxData[rlen] = 0;
                         // MAC 比对：只响应发给本节点的指令
                         // P0-6：未注册时不响应指令（myRecvAddr=0，ACK 会发到地址 0 导致丢包）
-                        if (registered && strstr((char*)pRxData, myMacStr)) {
+                        if (registered && strstr((char*)gRxData, myMacStr)) {
                             char ack[60] = {0};
-                            if (strstr((char*)pRxData, "LED=1")) {
+                            if (strstr((char*)gRxData, "LED=1")) {
                                 D7 = 0;
                                 printf("{cmd=LED ON}\r\n");
                                 sprintf(ack, "{CMD=SUCCESS, LED=1, MAC=%s}", myMacStr);
-                            } else if (strstr((char*)pRxData, "LED=0")) {
+                            } else if (strstr((char*)gRxData, "LED=0")) {
                                 D7 = 1;
                                 printf("{cmd=LED OFF}\r\n");
                                 sprintf(ack, "{CMD=SUCCESS, LED=0, MAC=%s}", myMacStr);
-                            } else if (strstr((char*)pRxData, "STATUS=1")) {
+                            } else if (strstr((char*)gRxData, "STATUS=1")) {
                                 sendEnable = 1;
                                 printf("{cmd=STATUS ON}\r\n");
                                 sprintf(ack, "{CMD=SUCCESS, STATUS=1, MAC=%s}", myMacStr);
-                            } else if (strstr((char*)pRxData, "STATUS=0")) {
+                            } else if (strstr((char*)gRxData, "STATUS=0")) {
                                 sendEnable = 0;
                                 printf("{cmd=STATUS OFF}\r\n");
                                 sprintf(ack, "{CMD=SUCCESS, STATUS=0, MAC=%s}", myMacStr);
@@ -273,7 +275,6 @@ void rfSendData(void){
 /* 射频模块接收数据函数 */
 void rfRecvData(void)
 {
-    uint8 pRxData[128];
     int rlen;
     static unsigned int rec_counter = 0;                        //接收次数计数器
     printf("{data=recv node start up...}");
@@ -281,11 +282,11 @@ void rfRecvData(void)
     // Main loop
     while (TRUE) {
         while(!basicRfPacketIsReady());
-        rlen = basicRfReceive(pRxData, sizeof pRxData, NULL);
+        rlen = basicRfReceive(gRxData, sizeof gRxData, NULL);
         if(rlen > 0) {
-          pRxData[rlen] = 0;
+          gRxData[rlen] = 0;
           printf("{data=");                                     //接收到
-          printf((char *)pRxData);                              //数据后
+          printf((char *)gRxData);                              //数据后
           printf(" %d",++rec_counter);                          //接收数据的次数
           printf("}");                                          //在LCD上显示
           
