@@ -460,7 +460,10 @@ uint8 halRfTransmit(void)
     // Waiting for transmission to finish (超时保护：RF 挂起时退出，避免死机)
     while(!(RFIRQF1 & IRQ_TXDONE) && ++to < 20000);
     if (!(RFIRQF1 & IRQ_TXDONE)) {
-        ISFLUSHTX();   // 清 TX FIFO，防止状态机锁死
+        ISFLUSHTX();   // 清 TX FIFO
+        ISRFOFF();     // 关 RF，状态机回 IDLE（自愈：防止 RF 卡死后信标永久发不出）
+        ISFLUSHRX();   // 清 RX FIFO
+        ISRXON();      // 重开 RX，恢复接收
         return FAILED;
     }
 

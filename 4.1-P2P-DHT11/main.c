@@ -86,7 +86,7 @@ void doRegister(void) {
     // 修复2：收到信标后延时 10ms 再发 REG，避开接收节点发信标后的 RF 状态切换过渡期
     // 修复3：REG 失败不 return，继续循环等下一个信标重试，避免每次重新等 3.5s
     halRfSetChannel(RF_CHANNEL);
-    halRfReceiveOn();
+    basicRfReceiveOn();    // 用 basicRfReceiveOn 设 txState.receiveOn=TRUE，避免 basicRfSendPacket 发完关 RX 导致 ISFLUSHRX 丢包
     for (tried = 0; tried < 350; tried++) {     // 350 × 10ms = 3.5s
         halMcuWaitMs(10);
         if (basicRfPacketIsReady()) {
@@ -105,16 +105,16 @@ void doRegister(void) {
                     if (regResult == SUCCESS) {
                         registered = 1;
                         printf("{reg=OK, MAC=%s}\r\n", myMacStr);
-                        halRfReceiveOff();
+                        basicRfReceiveOff();
                         return;
                     }
                     printf("{reg=RETRY}\r\n");
-                    halRfReceiveOn();          // 重新开 RX，继续等下一个信标
+                    // RX 保持开（txState.receiveOn=TRUE，basicRfSendPacket 发完不关 RX），继续等下一个信标
                 }
             }
         }
     }
-    halRfReceiveOff();
+    basicRfReceiveOff();
 
     // 阶段2：默认信道未命中，快速扫描其他 15 个信道（容错：接收节点可能切信道）
     for (tried = 1; tried < 16; tried++) {
