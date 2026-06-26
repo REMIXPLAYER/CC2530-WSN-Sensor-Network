@@ -168,7 +168,7 @@
         </option>
         <option>
           <name>General Idata Stack Size</name>
-          <state>0x80</state>
+          <state>0xC0</state>
         </option>
         <option>
           <name>General Pdata Stack Size</name>

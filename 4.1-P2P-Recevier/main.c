@@ -13,7 +13,7 @@
 
 #define RF_CHANNEL            24                                // 2.4 GHz RF channel 
 #define PAN_ID                0x1410                            // PAN ID
-#define MY_ADDR               0x4102                            // 本机短地址（固定，传感器通过信标发现）
+#define MY_ADDR               0x4206                            // 本机短地址（固定，传感器通过信标发现）
 
 static basicRfCfg_t basicRfConfig;
 
@@ -82,6 +82,11 @@ void rfRecvData(void)
     printf("{data=recv node start up...}\r\n");
     
     while (TRUE) {
+        // 喂狗：先写 0xA 到 WDCTL[7:4]，再写 0x5，重置倒计时
+        // CPU 跑飞后不再喂狗 → 1 秒后硬件自动复位
+        WDCTL = (WDCTL & 0x0F) | 0xA0;
+        WDCTL = (WDCTL & 0x0F) | 0x50;
+        
         // 防御：周期性恢复全局中断 + UART RX 中断使能
         // 防止 idata 栈溢出破坏 HAL_INT_LOCK 保存值导致 EA/URX0IE 被意外关闭后 @ 指令无响应
         EA = 1;
@@ -95,7 +100,9 @@ void rfRecvData(void)
             rlen = basicRfReceive((uint8*)gRxData, sizeof(gRxData), NULL);
             if (rlen > 0 && rlen < sizeof(gRxData)) {
                 gRxData[rlen] = 0;
-                printf("%s\r\n", gRxData);
+                // 用 Uart_Send_String 替代 printf，避免 printf 深层调用链消耗 idata 栈
+                Uart_Send_String(gRxData);
+                Uart_Send_String("\r\n");
             }
         }
         
@@ -116,6 +123,10 @@ void main(void)
     led_init();
     uart0_init(0x00, 0x00);
     lcd_dis();
+    
+    // 看门狗初始化：1 秒超时，CPU 跑飞后自动复位自愈
+    // WDCTL[3:2]=00→1s, [1]=1→启用, [0]=0→复位模式
+    WDCTL = 0x02;       // 启用看门狗，1 秒超时，超时后硬件复位
     
     if (FAILED == halRfInit()) {
         HAL_ASSERT(FALSE);
@@ -176,12 +187,14 @@ void uart0_init(unsigned char StopBits,unsigned char Parity)
   EA = 1;
 }
 
-/*串口发送字节函数
+/*串口发送字节函数（含超时保护）
 -------------------------------------------------------*/
 void Uart_Send_char(char ch)
 {
+  uint16 to = 0;
   U0DBUF = ch;
-  while(UTX0IF == 0);
+  while(UTX0IF == 0 && ++to < 5000);   // 超时保护：UART TX 挂起时退出，避免死机
+  if (to >= 5000) { UTX0IF = 0; return; }   // 自愈：丢弃当前字节
   UTX0IF = 0;
 }
 
