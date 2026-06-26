@@ -99,18 +99,6 @@ void Uart_Send_String(char *Data)
   }
 }
 
-/*串口接收字节函数
--------------------------------------------------------*/
-int Uart_Recv_char(void)
-{
-  int ch;
-    
-  while (URX0IF == 0);
-  ch = U0DBUF;
-  URX0IF = 0;
-  return ch;
-}
-
 /*延时函数
 -------------------------------------------------------*/
 void halWait(unsigned char wait)
@@ -168,14 +156,16 @@ uint8 csmaCaSendPacket(uint16 destAddr, uint8* pPayload, uint8 length);
 /* 信道扫描 + 信标发现 + 注册（分阶段扫描：默认信道长等待 + 其他信道快速容错） */
 void doRegister(void) {
     uint8 ch;
-    uint8 tried;
+    uint16 tried;
     char rxBuf[32];
     int rlen;
-    // 阶段1：优先在默认信道（RF_CHANNEL=24）分片轮询 2.5s，覆盖完整信标周期（~2s）
-    // 修复：原 50ms 窗口 vs 2s 信标周期，命中率仅 2.5%，注册需 ~30s
+    // 阶段1：优先在默认信道（RF_CHANNEL=24）分片轮询 3.5s，覆盖近 2 个信标周期（~2s）
+    // 修复1：原 50ms 窗口 vs 2s 信标周期，命中率仅 2.5%，注册需 ~30s
+    // 修复2：收到信标后延时 10ms 再发 REG，避开接收节点发信标后的 RF 状态切换过渡期
+    // 修复3：REG 失败不 return，继续循环等下一个信标重试，避免每次重新等 3.5s
     halRfSetChannel(RF_CHANNEL);
     halRfReceiveOn();
-    for (tried = 0; tried < 250; tried++) {     // 250 × 10ms = 2.5s
+    for (tried = 0; tried < 350; tried++) {     // 350 × 10ms = 3.5s
         halMcuWaitMs(10);
         if (basicRfPacketIsReady()) {
             rlen = basicRfReceive((uint8*)rxBuf, sizeof(rxBuf), NULL);
@@ -185,6 +175,7 @@ void doRegister(void) {
                     myRecvAddr = basicRfReceiveAddress();
                     lastBeaconCh = RF_CHANNEL;
                     halRfSetChannel(RF_CHANNEL);
+                    halMcuWaitMs(10);          // 避开接收节点 RF 状态切换过渡期
                     char reg[50];
                     uint8 regResult;
                     sprintf(reg, "{REG=MAC:%s}", myMacStr);
@@ -192,10 +183,11 @@ void doRegister(void) {
                     if (regResult == SUCCESS) {
                         registered = 1;
                         printf("{reg=OK, MAC=%s}\r\n", myMacStr);
-                    } else {
-                        printf("{reg=RETRY}\r\n");
+                        halRfReceiveOff();
+                        return;
                     }
-                    return;
+                    printf("{reg=RETRY}\r\n");
+                    halRfReceiveOn();          // 重新开 RX，继续等下一个信标
                 }
             }
         }
@@ -216,6 +208,7 @@ void doRegister(void) {
                     myRecvAddr = basicRfReceiveAddress();
                     lastBeaconCh = ch;
                     halRfSetChannel(ch);
+                    halMcuWaitMs(10);          // 避开接收节点 RF 状态切换过渡期
                     char reg[50];
                     uint8 regResult;
                     sprintf(reg, "{REG=MAC:%s}", myMacStr);

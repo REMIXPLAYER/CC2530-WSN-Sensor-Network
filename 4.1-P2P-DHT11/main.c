@@ -78,14 +78,16 @@ uint8 csmaCaSendPacket(uint16 destAddr, uint8* pPayload, uint8 length);
 /* 信道扫描 + 信标发现 + 注册（分阶段扫描：默认信道长等待 + 其他信道快速容错） */
 void doRegister(void) {
     uint8 ch;
-    uint8 tried;
+    uint16 tried;
     char rxBuf[32];
     int rlen;
-    // 阶段1：优先在默认信道（RF_CHANNEL=24）分片轮询 2.5s，覆盖完整信标周期（~2s）
-    // 修复：原 50ms 窗口 vs 2s 信标周期，命中率仅 2.5%，注册需 ~30s
+    // 阶段1：优先在默认信道（RF_CHANNEL=24）分片轮询 3.5s，覆盖近 2 个信标周期（~2s）
+    // 修复1：原 50ms 窗口 vs 2s 信标周期，命中率仅 2.5%，注册需 ~30s
+    // 修复2：收到信标后延时 10ms 再发 REG，避开接收节点发信标后的 RF 状态切换过渡期
+    // 修复3：REG 失败不 return，继续循环等下一个信标重试，避免每次重新等 3.5s
     halRfSetChannel(RF_CHANNEL);
     halRfReceiveOn();
-    for (tried = 0; tried < 250; tried++) {     // 250 × 10ms = 2.5s
+    for (tried = 0; tried < 350; tried++) {     // 350 × 10ms = 3.5s
         halMcuWaitMs(10);
         if (basicRfPacketIsReady()) {
             rlen = basicRfReceive((uint8*)rxBuf, sizeof(rxBuf), NULL);
@@ -95,6 +97,7 @@ void doRegister(void) {
                     myRecvAddr = basicRfReceiveAddress();
                     lastBeaconCh = RF_CHANNEL;
                     halRfSetChannel(RF_CHANNEL);
+                    halMcuWaitMs(10);          // 避开接收节点 RF 状态切换过渡期
                     char reg[50];
                     uint8 regResult;
                     sprintf(reg, "{REG=MAC:%s}", myMacStr);
@@ -102,10 +105,11 @@ void doRegister(void) {
                     if (regResult == SUCCESS) {
                         registered = 1;
                         printf("{reg=OK, MAC=%s}\r\n", myMacStr);
-                    } else {
-                        printf("{reg=RETRY}\r\n");
+                        halRfReceiveOff();
+                        return;
                     }
-                    return;
+                    printf("{reg=RETRY}\r\n");
+                    halRfReceiveOn();          // 重新开 RX，继续等下一个信标
                 }
             }
         }
@@ -126,6 +130,7 @@ void doRegister(void) {
                     myRecvAddr = basicRfReceiveAddress();
                     lastBeaconCh = ch;
                     halRfSetChannel(ch);
+                    halMcuWaitMs(10);          // 避开接收节点 RF 状态切换过渡期
                     char reg[50];
                     uint8 regResult;
                     sprintf(reg, "{REG=MAC:%s}", myMacStr);
@@ -376,18 +381,6 @@ void Uart_Send_String(char *Data)
   }
 }
 
-/*串口接收字节函数
--------------------------------------------------------*/
-int Uart_Recv_char(void)
-{
-  int ch;
-    
-  while (URX0IF == 0);
-  ch = U0DBUF;
-  URX0IF = 0;
-  return ch;
-}
-
 /*延时函数
 -------------------------------------------------------*/
 void halWait(unsigned char wait)
@@ -406,11 +399,15 @@ void halWait(unsigned char wait)
 }
 
 // DHT11 温湿度函数实现
+static uint8 dht11TimedOut = 0;   // 超时标志：DHT11 通信异常时置位，避免死循环
+
 static char dht11_read_bit(void)
 {
   int i = 0;
-  
-  while (!COM_R);
+  int to = 0;
+
+  while (!COM_R && ++to < 500);   // 超时保护：数据线卡低时退出，避免死机
+  if (to >= 500) { dht11TimedOut = 1; return 0; }
   for (i=0; i<200; i++) {
     if (COM_R == 0) break;
   }
@@ -425,8 +422,9 @@ static unsigned char dht11_read_byte(void)
   for (i=7; i>=0; i--) {
     b = dht11_read_bit();
     v |= b<<i;
+    if (dht11TimedOut) return 0;   // 超时则中断读取
   }
-  return v; 
+  return v;
 }
 
 void dht11_io_init(void)
@@ -450,8 +448,9 @@ void dht11_update(void)
 {
   int flag = 1;
   unsigned char dat1, dat2, dat3, dat4, dat5, ck;
-  
-  //拉低延时18ms 
+
+  dht11TimedOut = 0;           // 复位超时标志
+  //拉低延时18ms
   COM_CLR;
   halMcuWaitMs(18);
   COM_SET;
@@ -472,15 +471,13 @@ void dht11_update(void)
   
   
   dat1 = dht11_read_byte();
-  
   dat2 = dht11_read_byte();
-  
   dat3 = dht11_read_byte();
-   
-  dat4 = dht11_read_byte();  
-  
-  dat5 = dht11_read_byte();            
-  
+  dat4 = dht11_read_byte();
+  dat5 = dht11_read_byte();
+
+  if (dht11TimedOut) return;   // 超时则保留上次有效数据，不更新
+
   ck = dat1 + dat2 + dat3 + dat4;
   
   if (ck == dat5) {

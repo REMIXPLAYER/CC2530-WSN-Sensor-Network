@@ -453,11 +453,16 @@ uint8 halRfWriteMemory(uint16 addr, uint8* pData, uint8 length)
 uint8 halRfTransmit(void)
 {
     uint8 status;
+    uint16 to = 0;
 
     ISTXON(); // Sending
 
-    // Waiting for transmission to finish
-    while(!(RFIRQF1 & IRQ_TXDONE) );
+    // Waiting for transmission to finish (超时保护：RF 挂起时退出，避免死机)
+    while(!(RFIRQF1 & IRQ_TXDONE) && ++to < 20000);
+    if (!(RFIRQF1 & IRQ_TXDONE)) {
+        ISFLUSHTX();   // 清 TX FIFO，防止状态机锁死
+        return FAILED;
+    }
 
     RFIRQF1 = ~IRQ_TXDONE;
     status= SUCCESS;
@@ -565,8 +570,9 @@ void halRfRxInterruptConfig(ISR_FUNC_PTR pf)
 */
 void halRfWaitTransceiverReady(void)
 {
-    // Wait for SFD not active and TX_Active not active
-    while (FSMSTAT1 & (BV(1) | BV(5) ));
+    uint16 to = 0;
+    // Wait for SFD not active and TX_Active not active (超时保护：避免 RF 状态机卡死)
+    while (FSMSTAT1 & (BV(1) | BV(5) ) && ++to < 20000);
 }
 
 #ifndef MRFI
@@ -642,7 +648,7 @@ works of, modify, distribute, perform, display or sell this Software and/or
 its documentation for any purpose.
 
 YOU FURTHER ACKNOWLEDGE AND AGREE THAT THE SOFTWARE AND DOCUMENTATION ARE
-PROVIDED �AS IS?WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+PROVIDED �AS IS?WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 INCLUDING WITHOUT LIMITATION, ANY WARRANTY OF MERCHANTABILITY, TITLE,
 NON-INFRINGEMENT AND FITNESS FOR A PARTICULAR PURPOSE. IN NO EVENT SHALL
 TEXAS INSTRUMENTS OR ITS LICENSORS BE LIABLE OR OBLIGATED UNDER CONTRACT,

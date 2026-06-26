@@ -80,6 +80,10 @@ void rfRecvData(void)
     printf("{data=recv node start up...}\r\n");
     
     while (TRUE) {
+        // 防御：周期性恢复全局中断 + UART RX 中断使能
+        // 防止 idata 栈溢出破坏 HAL_INT_LOCK 保存值导致 EA/URX0IE 被意外关闭后 @ 指令无响应
+        EA = 1;
+        URX0IE = 1;
         // 处理串口指令（广播透传）
         if (cmdReady) { cmdReady = 0; broadcastCmd(cmdBuf); }
         // P1-10：溢出提示（ISR 检测到缓冲区溢出时置标志）
@@ -187,16 +191,4 @@ void Uart_Send_String(char *Data)
   {
     Uart_Send_char(*Data++);
   }
-}
-
-/*串口接收字节函数
--------------------------------------------------------*/
-int Uart_Recv_char(void)
-{
-  int ch;
-    
-  while (URX0IF == 0);
-  ch = U0DBUF;
-  URX0IF = 0;
-  return ch;
 }

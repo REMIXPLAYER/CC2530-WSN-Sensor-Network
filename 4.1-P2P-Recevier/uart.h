@@ -5,6 +5,5 @@
 
 void Uart_Send_char(char ch);
 void Uart_Send_String(char *Data);
-int Uart_Recv_char(void);
 
 #endif
