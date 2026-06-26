@@ -75,15 +75,46 @@ void readMacAddress(uint8* macAddr) {
 /* 前向声明 */
 uint8 csmaCaSendPacket(uint16 destAddr, uint8* pPayload, uint8 length);
 
-/* 信道扫描 + 信标发现 + 注册 */
+/* 信道扫描 + 信标发现 + 注册（分阶段扫描：默认信道长等待 + 其他信道快速容错） */
 void doRegister(void) {
     uint8 ch;
     uint8 tried;
     char rxBuf[32];
     int rlen;
-    // P1-8：从上次成功信道开始轮转扫描，加速注册（默认 RF_CHANNEL）
-    for (tried = 0; tried < 16; tried++) {
-        ch = 11 + ((lastBeaconCh - 11 + tried) % 16);
+    // 阶段1：优先在默认信道（RF_CHANNEL=24）分片轮询 2.5s，覆盖完整信标周期（~2s）
+    // 修复：原 50ms 窗口 vs 2s 信标周期，命中率仅 2.5%，注册需 ~30s
+    halRfSetChannel(RF_CHANNEL);
+    halRfReceiveOn();
+    for (tried = 0; tried < 250; tried++) {     // 250 × 10ms = 2.5s
+        halMcuWaitMs(10);
+        if (basicRfPacketIsReady()) {
+            rlen = basicRfReceive((uint8*)rxBuf, sizeof(rxBuf), NULL);
+            if (rlen > 0 && rlen < sizeof(rxBuf)) {
+                rxBuf[rlen] = 0;
+                if (strstr(rxBuf, "TYPE=RECV")) {
+                    myRecvAddr = basicRfReceiveAddress();
+                    lastBeaconCh = RF_CHANNEL;
+                    halRfSetChannel(RF_CHANNEL);
+                    char reg[50];
+                    uint8 regResult;
+                    sprintf(reg, "{REG=MAC:%s}", myMacStr);
+                    regResult = csmaCaSendPacket(myRecvAddr, (uint8*)reg, strlen(reg) + 1);
+                    if (regResult == SUCCESS) {
+                        registered = 1;
+                        printf("{reg=OK, MAC=%s}\r\n", myMacStr);
+                    } else {
+                        printf("{reg=RETRY}\r\n");
+                    }
+                    return;
+                }
+            }
+        }
+    }
+    halRfReceiveOff();
+
+    // 阶段2：默认信道未命中，快速扫描其他 15 个信道（容错：接收节点可能切信道）
+    for (tried = 1; tried < 16; tried++) {
+        ch = 11 + ((RF_CHANNEL - 11 + tried) % 16);
         halRfSetChannel(ch);
         halRfReceiveOn();
         halMcuWaitMs(50);
@@ -93,8 +124,8 @@ void doRegister(void) {
                 rxBuf[rlen] = 0;
                 if (strstr(rxBuf, "TYPE=RECV")) {
                     myRecvAddr = basicRfReceiveAddress();
-                    lastBeaconCh = ch;    // 记住信标信道，下次加速
-                    halRfSetChannel(ch);    // 锁定接收节点所在信道
+                    lastBeaconCh = ch;
+                    halRfSetChannel(ch);
                     char reg[50];
                     uint8 regResult;
                     sprintf(reg, "{REG=MAC:%s}", myMacStr);
