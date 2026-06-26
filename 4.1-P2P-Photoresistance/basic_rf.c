@@ -281,9 +281,16 @@ static void basicRfRxFrmDoneIsr(void)
         // No, it is data
     } else {
 
-        // It is assumed that the radio rejects packets with invalid length.
-        // Subtract the number of bytes in the frame overhead to get actual payload.
+        // 修复：检查 packetLength 合法性，防止 rxi.length 为负值
+        // 原代码假设 RF 拒绝无效长度包，但 CC2530 AUTO_CRC 不会拒绝，噪声包可触发
+        // rxi.length 为负 → min() 返回负值 → memcpy size_t 越界 → 覆盖 XDSP → CPU 跑飞
+        if (pHdr->packetLength < BASIC_RF_PACKET_OVERHEAD_SIZE) {
+            halIntOff();
+            halRfEnableRxInterrupt();
+            return;
+        }
 
+        // Subtract the number of bytes in the frame overhead to get actual payload.
         rxi.length = pHdr->packetLength - BASIC_RF_PACKET_OVERHEAD_SIZE;
 
         #ifdef SECURITY_CCM
@@ -509,10 +516,15 @@ uint8 basicRfPacketIsReady(void)
 */
 uint8 basicRfReceive(uint8* pRxData, uint8 len, int16* pRssi)
 {
+    uint8 copyLen;
     // Accessing shared variables -> this is a critical region
     // Critical region start
     halIntOff();
-    memcpy(pRxData, rxi.pPayload, min(rxi.length, len));
+    // 修复：防御性检查，rxi.length > 0 才 memcpy，防止负值转 size_t 越界
+    copyLen = (rxi.length > 0 && (uint8)rxi.length < len) ? (uint8)rxi.length : 0;
+    if (copyLen > 0) {
+        memcpy(pRxData, rxi.pPayload, copyLen);
+    }
     if(pRssi != NULL) {
         if(rxi.rssi < 128){
             *pRssi = rxi.rssi - halRfGetRssiOffset();
@@ -526,7 +538,7 @@ uint8 basicRfReceive(uint8* pRxData, uint8 len, int16* pRssi)
 
     // Critical region end
 
-    return min(rxi.length, len);
+    return copyLen;
 }
 
 /**********************************************************************************
